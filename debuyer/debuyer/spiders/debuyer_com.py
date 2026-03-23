@@ -1,7 +1,7 @@
 
 import scrapy
-
-
+import json
+import os
 
 class DebuyerComSpider(scrapy.Spider):
     name = "debuyer.com"
@@ -14,44 +14,103 @@ class DebuyerComSpider(scrapy.Spider):
         'COOKIES_ENABLED': True,
     }
 
+    def load_cookies(self):
+        # Load cookies as a list of dicts (browser format)
+        workspace_root = os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..', '..'))
+        cookies_path = os.path.join(workspace_root, 'secrets', 'debuyer_cookies.json')
+        with open(cookies_path, 'r', encoding='utf-8') as f:
+            cookies = json.load(f)
+        return cookies
+
+    def cookies_for_scrapy(self, cookies):
+        # Convert browser cookies to dict for Scrapy
+        return {c['name']: c['value'] for c in cookies}
 
     def start_requests(self):
+        cookies = self.load_cookies()
+        # Set cookies in Playwright context
+        def sanitize_samesite(val):
+            if val is None:
+                return "Lax"
+            val = str(val).capitalize()
+            return val if val in ("Strict", "Lax", "None") else "Lax"
+
+        playwright_cookies = [
+            {
+                "name": c["name"],
+                "value": c["value"],
+                "domain": c["domain"],
+                "path": c.get("path", "/"),
+                "expires": int(c["expirationDate"]) if c.get("expirationDate") else -1,
+                "httpOnly": c.get("httpOnly", False),
+                "secure": c.get("secure", False),
+                "sameSite": sanitize_samesite(c.get("sameSite")),
+            }
+            for c in cookies
+        ]
         yield scrapy.Request(
             url="https://www.debuyer.com/en/13-bakeware",
             callback=self.parse,
-            meta={"playwright": True},
+            cookies=self.cookies_for_scrapy(cookies),
+            meta={
+                "playwright": True,
+                "playwright_page_methods": [
+                    {"method": "wait_for_selector", "selector": "body", "kwargs": {"timeout": 5000}}
+                ],
+                "playwright_context_kwargs": {
+                    "storage_state": {"cookies": playwright_cookies}
+                },
+            },
+            dont_filter=True,
         )
 
-    def parse(self, response):
+    async def parse(self, response):
+        # Yield the HTML as an item for instant inspection
+        yield {"_debug_html": response.text[:10000]}  # Only first 10k chars for brevity
+
         # Step 1: Find all subcategory links on the main bakeware page
         subcat_links = response.css('section.category-miniature a::attr(href)').getall()
+        self.logger.info(f"Found {len(subcat_links)} subcategory links: {subcat_links}")
+        if not subcat_links:
+            self.logger.warning("No subcategory links found! Check the exported JSON for _debug_html.")
+        cookies = self.load_cookies()
         for link in subcat_links:
             yield scrapy.Request(
                 url=link,
                 callback=self.parse_subcategory,
-                meta={"playwright": True},
+                cookies=self.cookies_for_scrapy(cookies),
+                meta={
+                    "playwright": True,
+                },
             )
 
-
-    def parse_subcategory(self, response):
+    async def parse_subcategory(self, response):
         # Step 2: For each subcategory, paginate and extract product links
         product_cards = response.css('article.product-miniature')
+        cookies = self.load_cookies()
         for card in product_cards:
             product_url = card.css('a::attr(href)').get()
             if product_url:
                 yield scrapy.Request(
                     url=product_url,
                     callback=self.parse_product,
-                    meta={"playwright": True},
+                    cookies=self.cookies_for_scrapy(cookies),
+                    meta={
+                        "playwright": True,
+                    },
                 )
 
         # Pagination: look for next page link
         next_page = response.css('li.page-item a[rel="next"]::attr(href)').get()
+        cookies = self.load_cookies()
         if next_page:
             yield scrapy.Request(
                 url=next_page,
                 callback=self.parse_subcategory,
-                meta={"playwright": True},
+                cookies=self.cookies_for_scrapy(cookies),
+                meta={
+                    "playwright": True,
+                },
             )
 
     def parse_product(self, response):
